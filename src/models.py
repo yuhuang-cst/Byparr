@@ -38,6 +38,7 @@ class Solution(BaseModel):
     user_agent: str = ""
     headers: dict[str, Any] = {}
     response: str = ""
+    file_base64: str | None = None  # base64 encoded file content for request.download
 
 
 class LinkResponse(BaseModel):

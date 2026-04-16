@@ -24,7 +24,7 @@ PORT = int(os.getenv("PORT", "8191"))
 
 CHALLENGE_TITLES_MAP: dict[CaptchaType, list[str]] = {
     # Cloudflare
-    CaptchaType.CLOUDFLARE_INTERSTITIAL: ["Just a moment..."],
+    CaptchaType.CLOUDFLARE_INTERSTITIAL: ["Just a moment...", "DDoS-Guard"],
 }
 
 CHALLENGE_TITLES = [
