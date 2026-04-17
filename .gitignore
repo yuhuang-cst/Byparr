@@ -172,3 +172,7 @@ downloaded_files/
 
 # Browser Data
 browser_data/
+
+# Rsync
+rsync_*.sh
+rsync_*exclude*.txt
