@@ -86,7 +86,6 @@ async def _solve_challenge(page: Page, dep: CamoufoxDepClass, timer: TimeoutTime
         logger.info("Challenge solved!")
     except TimeoutError:
         logger.warning("ClickSolver timed out, waiting for JS challenge...")
-        # Fallback: wait for JS-only challenges to auto-complete
         for _ in range(15):
             if await page.title() not in CHALLENGE_TITLES:
                 logger.info("JS challenge resolved!")
@@ -166,13 +165,22 @@ async def _handle_get(
 async def _handle_download(
         request: LinkRequest, dep: CamoufoxDepClass,
         timer: TimeoutTimer, start_time: int) -> LinkResponse:
-    """Handle request.download — navigate, solve challenge, download file via JS fetch."""
-    page = dep.page
+    """Handle request.download — navigate to base URL, solve challenge, JS fetch file.
 
-    # Step 1: Navigate to URL
-    logger.info(f"[Download] Navigating to {request.url[:80]}...")
+    Unlike FlareSolverr (Chrome), Camoufox uses Firefox which has a built-in PDF
+    viewer that intercepts PDF responses. To avoid this, we don't navigate to the
+    PDF URL directly. Instead:
+    1. Navigate to the base URL (e.g. https://www.nature.com) to pass Cloudflare
+    2. Use JS fetch() from that page to download the PDF (same-origin, no CORS)
+    """
+    page = dep.page
+    target_url = request.url
+    base_url = f"{urlparse(target_url).scheme}://{urlparse(target_url).netloc}"
+
+    # Step 1: Navigate to base URL to establish session and pass Cloudflare
+    logger.info(f"[Download] Navigating to base URL {base_url} ...")
     try:
-        await page.goto(request.url, timeout=min(timer.remaining(), 30) * 1000,
+        await page.goto(base_url, timeout=min(timer.remaining(), 30) * 1000,
                         wait_until='domcontentloaded')
     except Exception as e:
         logger.debug(f"[Download] Navigation error (may be expected): {str(e)[:80]}")
@@ -184,31 +192,11 @@ async def _handle_download(
         logger.error("[Download] Challenge solving timed out")
         raise HTTPException(status_code=408, detail="Challenge solving timed out")
 
-    # Step 3: Wait for non-Cloudflare JS challenges (AWS WAF, etc.)
+    # Step 3: Wait for non-Cloudflare JS challenges
     await _wait_for_js_challenge(page)
 
-    # Step 4: Determine fetch URL (handle CDN redirects and native downloads)
-    current_url = page.url
-    target_origin = f"{urlparse(request.url).scheme}://{urlparse(request.url).netloc}"
-    current_origin = f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}"
-
-    is_internal = current_url.startswith(('chrome://', 'about:', 'data:'))
-
-    if is_internal:
-        # Browser triggered native download, tab is empty
-        logger.info(f"[Download] Native download detected, navigating to {target_origin}")
-        await page.goto(target_origin, wait_until='domcontentloaded')
-        await _solve_challenge(page, dep, timer)
-        fetch_url = request.url
-    elif current_origin != target_origin:
-        # Redirected to CDN domain, fetch from there (same-origin)
-        fetch_url = current_url
-        logger.info(f"[Download] Redirected to {current_origin}, will fetch: {fetch_url[:80]}")
-    else:
-        fetch_url = request.url
-
-    # Step 5: JS fetch the file
-    logger.info("[Download] Downloading via JS fetch...")
+    # Step 4: JS fetch the PDF from the same-origin page
+    logger.info(f"[Download] Downloading via JS fetch: {target_url[:80]}...")
     try:
         js_result = await page.evaluate("""
             async (url) => {
@@ -230,7 +218,7 @@ async def _handle_download(
                     return {error: e.toString()};
                 }
             }
-        """, fetch_url)
+        """, target_url)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"JS fetch failed: {e}")
 
@@ -251,7 +239,7 @@ async def _handle_download(
         message="File downloaded successfully",
         solution=Solution(
             user_agent=await page.evaluate("navigator.userAgent"),
-            url=current_url,
+            url=page.url,
             status=HTTPStatus.OK,
             cookies=cookies,
             file_base64=file_base64,
