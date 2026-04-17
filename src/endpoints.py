@@ -1,6 +1,8 @@
+import asyncio
 import time
 import warnings
 from asyncio import wait_for
+from base64 import b64encode
 from http import HTTPStatus
 from typing import Annotated
 from urllib.parse import urlparse
@@ -165,13 +167,13 @@ async def _handle_get(
 async def _handle_download(
         request: LinkRequest, dep: CamoufoxDepClass,
         timer: TimeoutTimer, start_time: int) -> LinkResponse:
-    """Handle request.download — navigate to base URL, solve challenge, JS fetch file.
+    """Handle request.download — download file using Playwright response interception.
 
-    Unlike FlareSolverr (Chrome), Camoufox uses Firefox which has a built-in PDF
-    viewer that intercepts PDF responses. To avoid this, we don't navigate to the
-    PDF URL directly. Instead:
-    1. Navigate to the base URL (e.g. https://www.nature.com) to pass Cloudflare
-    2. Use JS fetch() from that page to download the PDF (same-origin, no CORS)
+    Strategy:
+    1. Navigate to base URL to pass Cloudflare challenge
+    2. Try JS fetch from same-origin page (works for most publishers)
+    3. If JS fetch fails (CORS for CDN-redirected publishers), use Playwright
+       response interception to capture the PDF binary directly from navigation
     """
     page = dep.page
     target_url = request.url
@@ -183,7 +185,7 @@ async def _handle_download(
         await page.goto(base_url, timeout=min(timer.remaining(), 30) * 1000,
                         wait_until='domcontentloaded')
     except Exception as e:
-        logger.debug(f"[Download] Navigation error (may be expected): {str(e)[:80]}")
+        logger.debug(f"[Download] Base URL navigation error: {str(e)[:80]}")
 
     # Step 2: Solve Cloudflare challenge if present
     try:
@@ -195,8 +197,37 @@ async def _handle_download(
     # Step 3: Wait for non-Cloudflare JS challenges
     await _wait_for_js_challenge(page)
 
-    # Step 4: JS fetch the PDF from the same-origin page
-    logger.info(f"[Download] Downloading via JS fetch: {target_url[:80]}...")
+    # Step 4: Try JS fetch first (same-origin, fast)
+    logger.info(f"[Download] Trying JS fetch: {target_url[:80]}...")
+    file_base64 = await _js_fetch_file(page, target_url)
+
+    # Step 5: If JS fetch failed, use Playwright response interception
+    # This handles CDN-redirected publishers (OUP→silverchair, ScienceDirect→CDN)
+    # and avoids Firefox PDF viewer by capturing the response before rendering
+    if file_base64 is None:
+        logger.info("[Download] JS fetch failed, trying response interception...")
+        file_base64 = await _intercept_download(page, dep, timer, target_url)
+
+    if not file_base64:
+        raise HTTPException(status_code=500, detail="Failed to download file")
+
+    cookies = await dep.context.cookies()
+
+    return LinkResponse(
+        message="File downloaded successfully",
+        solution=Solution(
+            user_agent=await page.evaluate("navigator.userAgent"),
+            url=page.url,
+            status=HTTPStatus.OK,
+            cookies=cookies,
+            file_base64=file_base64,
+        ),
+        start_timestamp=start_time,
+    )
+
+
+async def _js_fetch_file(page: Page, url: str) -> str | None:
+    """Try to download file via JS fetch. Returns base64 string or None on failure."""
     try:
         js_result = await page.evaluate("""
             async (url) => {
@@ -218,31 +249,74 @@ async def _handle_download(
                     return {error: e.toString()};
                 }
             }
-        """, target_url)
+        """, url)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"JS fetch failed: {e}")
+        logger.warning(f"[Download] JS fetch exception: {e}")
+        return None
 
     if not isinstance(js_result, dict) or 'error' in js_result:
         error = js_result.get('error', 'Unknown') if isinstance(js_result, dict) else str(js_result)
-        raise HTTPException(status_code=500, detail=f"JS fetch error: {error}")
+        logger.warning(f"[Download] JS fetch error: {error}")
+        return None
 
-    file_base64 = js_result.get('data')
-    if not file_base64:
-        raise HTTPException(status_code=500, detail="JS fetch returned no data")
+    data = js_result.get('data')
+    if data:
+        logger.info(f"[Download] JS fetch success: {js_result.get('size', '?')} bytes, "
+                    f"type: {js_result.get('type', '?')}")
+    return data
 
-    logger.info(f"[Download] Success: {js_result.get('size', '?')} bytes, "
-                f"type: {js_result.get('type', '?')}")
 
-    cookies = await dep.context.cookies()
+async def _intercept_download(
+        page: Page, dep: CamoufoxDepClass, timer: TimeoutTimer,
+        url: str) -> str | None:
+    """Download file by intercepting the HTTP response via Playwright.
 
-    return LinkResponse(
-        message="File downloaded successfully",
-        solution=Solution(
-            user_agent=await page.evaluate("navigator.userAgent"),
-            url=page.url,
-            status=HTTPStatus.OK,
-            cookies=cookies,
-            file_base64=file_base64,
-        ),
-        start_timestamp=start_time,
-    )
+    Navigates to the URL and captures the response body before Firefox's PDF
+    viewer can intercept it. This works for CDN-redirected URLs too.
+    """
+
+    captured_body = None
+
+    async def handle_response(response):
+        nonlocal captured_body
+        # Capture any response that looks like a file (PDF, binary)
+        content_type = response.headers.get('content-type', '')
+        if ('pdf' in content_type or 'octet-stream' in content_type) and captured_body is None:
+            try:
+                body = await response.body()
+                if len(body) > 1000:  # Skip tiny error pages
+                    captured_body = body
+                    logger.info(f"[Download] Intercepted response: {len(body)} bytes, "
+                                f"type: {content_type}")
+            except Exception as e:
+                logger.debug(f"[Download] Failed to read response body: {e}")
+
+    page.on("response", handle_response)
+
+    try:
+        # Navigate to PDF URL — Playwright captures response before Firefox renders
+        try:
+            await page.goto(url, timeout=min(timer.remaining(), 30) * 1000,
+                            wait_until='domcontentloaded')
+        except Exception as e:
+            logger.debug(f"[Download] Navigation error (may be expected): {str(e)[:80]}")
+
+        # Solve challenge if we landed on one
+        try:
+            await _solve_challenge(page, dep, timer)
+        except TimeoutError:
+            pass
+
+        # Wait a bit for response to be captured
+        for _ in range(10):
+            if captured_body is not None:
+                break
+            await asyncio.sleep(1)
+
+    finally:
+        page.remove_listener("response", handle_response)
+
+    if captured_body:
+        return b64encode(captured_body).decode('ascii')
+
+    return None
